@@ -197,6 +197,7 @@
             if (!lang) lang = (navigator.language || navigator.userLanguage || 'en').substring(0, 2);
             if (TRANSLATIONS[lang]) this.currentLang = lang;
             else this.currentLang = 'en';
+            document.documentElement.lang = this.currentLang;
             if (this.dom.langSelect) this.dom.langSelect.value = this.currentLang;
         }
 
@@ -217,6 +218,7 @@
         changeLanguage(lang) {
             localStorage.setItem('raven_lang', lang);
             this.currentLang = lang;
+            document.documentElement.lang = lang;
             this.applyTranslations();
             this.updateMetaTitle();
             this.updateWikiLink();
