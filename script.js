@@ -3,6 +3,11 @@
         totalTime: 20 * 60,
         imageExt: '.svg',
         imagePath: 'images/',
+        questionCount: 60,
+        // How many upcoming matrices to fetch in the background. Kept small so
+        // the current question never competes with a long download queue.
+        prefetchAhead: 3,
+        prefetchBehind: 1,
     };
 
     const NORMATIVE_DISTRIBUTION = {
@@ -122,6 +127,70 @@
         return splineIQ.interpolate(Math.round(score));
     }
 
+    /**
+     * Fetches a few matrices around the current one during idle time.
+     *
+     * Uses plain <img> objects instead of fetch()/blob URLs: the browser's own
+     * image cache handles storage and eviction, so nothing has to be revoked
+     * and 60 decoded images are never kept in memory at once.
+     */
+    class ImagePreloader {
+        constructor() {
+            this.connection = navigator.connection || {};
+            this.requested = new Set();
+            this.scheduled = false;
+        }
+
+        url(index) {
+            return `${CONFIG.imagePath}${index}${CONFIG.imageExt}`;
+        }
+
+        get saveData() {
+            if (this.connection.saveData === true) return true;
+            return !!(window.matchMedia &&
+                window.matchMedia('(prefers-reduced-data: reduce)').matches);
+        }
+
+        /** 0 = do not prefetch, 3 = normal desktop connection. */
+        get aheadCount() {
+            if (this.saveData) return 0;
+            const type = this.connection.effectiveType;
+            if (type === 'slow-2g' || type === '2g') return 0;
+            if (type === '3g') return 1;
+            return CONFIG.prefetchAhead;
+        }
+
+        prefetch(index, priority) {
+            if (index < 1 || index > CONFIG.questionCount) return;
+            if (this.saveData || this.requested.has(index)) return;
+
+            this.requested.add(index);
+            const img = new Image();
+            img.decoding = 'async';
+            if ('fetchPriority' in img) img.fetchPriority = priority || 'low';
+            img.onerror = () => this.requested.delete(index);
+            img.src = this.url(index);
+        }
+
+        /** Queue neighbours of the current question, one idle callback at a time. */
+        schedule(current) {
+            if (this.scheduled) return;
+            this.scheduled = true;
+
+            const run = () => {
+                this.scheduled = false;
+                for (let i = 1; i <= this.aheadCount; i++) this.prefetch(current + i);
+                for (let i = 1; i <= CONFIG.prefetchBehind; i++) this.prefetch(current - i);
+            };
+
+            if ('requestIdleCallback' in window) {
+                requestIdleCallback(run, { timeout: 2000 });
+            } else {
+                setTimeout(run, 200);
+            }
+        }
+    }
+
     class RavenApp {
         constructor() {
             this.currentQuestion = 1;
@@ -133,12 +202,7 @@
             this.currentLang = 'en';
             this.endTime = 0;
             this.lastRenderedQuestion = null;
-
-            this.imageCache = new Map();
-
-            this.preloadQueue = [];
-            this.activeConnections = 0;
-            this.maxConnections = 1;
+            this.preloader = new ImagePreloader();
 
             this.screens = {
                 intro: document.getElementById('intro-screen'),
@@ -176,15 +240,24 @@
                 }
             });
 
-            this.startQueuePreloading(1, 60);
+            this.determineLanguage();
+            this.loadSavedAge();
+            this.applyTranslations();
+            this.updateMetaTitle();
+            this.updateWikiLink();
 
-            setTimeout(() => {
-                this.determineLanguage();
-                this.loadSavedAge();
-                this.applyTranslations();
-                this.updateMetaTitle();
-                this.updateWikiLink();
-            }, 0);
+            this.registerServiceWorker();
+        }
+
+        registerServiceWorker() {
+            if (!('serviceWorker' in navigator)) return;
+            const local = ['localhost', '127.0.0.1', '[::1]'].indexOf(location.hostname) !== -1;
+            if (location.protocol !== 'https:' && !local) return;
+
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' })
+                    .catch(() => { /* offline support is optional */ });
+            }, { once: true });
         }
 
         loadSavedAge() {
@@ -245,8 +318,11 @@
             this.timeLeft = CONFIG.totalTime;
             this.lastRenderedQuestion = null;
 
-            this.preloadQueue = [];
-            this.activeConnections = 0;
+            if (this.dom.qImage) {
+                this.dom.qImage.removeAttribute('src');
+                this.dom.qImage.classList.remove('is-loading');
+            }
+
             this.screens.intro.classList.remove('hidden');
         }
 
@@ -285,52 +361,11 @@
                 this.timeLeft = Math.max(0, remaining);
                 this.updateTimerDisplay();
                 if (this.timeLeft <= 0) this.finishTest();
-            }, 100);
+            }, 1000);
         }
 
         updateTimerDisplay() {
             this.dom.timerBar.style.width = `${(this.timeLeft / CONFIG.totalTime) * 100}%`;
-        }
-
-        preloadImage(index) {
-            if (this.imageCache.has(index) || index > 60 || index < 1) return;
-
-            this.activeConnections++;
-            const url = `${CONFIG.imagePath}${index}${CONFIG.imageExt}`;
-
-            fetch(url)
-            .then(response => {
-                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                return response.blob();
-            })
-            .then(blob => {
-                const blobUrl = URL.createObjectURL(blob);
-                this.imageCache.set(index, blobUrl);
-                this.activeConnections--;
-                this.processQueue();
-            })
-            .catch(error => {
-                console.error(`Failed to load image ${index}:`, error);
-                this.activeConnections--;
-                this.processQueue();
-            });
-        }
-
-        startQueuePreloading(startIndex, count) {
-            for (let i = 0; i < count; i++) {
-                const idx = startIndex + i;
-                if (!this.imageCache.has(idx)) {
-                    this.preloadQueue.push(idx);
-                }
-            }
-            this.processQueue();
-        }
-
-        processQueue() {
-            while (this.activeConnections < this.maxConnections && this.preloadQueue.length > 0) {
-                const index = this.preloadQueue.shift();
-                this.preloadImage(index);
-            }
         }
 
         getSeries(n) {
@@ -347,38 +382,9 @@
             const template = this.t('progress_template');
             this.dom.progressContainer.innerText = template.replace('{q}', q).replace('{s}', s);
 
-            const img = this.dom.qImage;
-
             if (this.lastRenderedQuestion !== q) {
                 this.lastRenderedQuestion = q;
-
-                if (!this.imageCache.has(q)) {
-                    this.preloadQueue.unshift(q);
-                    this.processQueue();
-                }
-
-                const blobUrl = this.imageCache.get(q);
-
-                if (blobUrl) {
-                    img.src = blobUrl;
-                    img.style.opacity = '1';
-                    img.style.filter = '';
-                    img.style.transition = 'none';
-                } else {
-                    const newSrc = `${CONFIG.imagePath}${q}${CONFIG.imageExt}`;
-                    img.src = newSrc;
-                    img.style.filter = 'grayscale(100%) brightness(0.7)';
-
-                    const onLoad = () => {
-                        img.onload = null;
-                        img.onerror = null;
-                        img.style.filter = '';
-                    };
-
-                    img.onload = onLoad;
-
-                    if (img.complete) onLoad();
-                }
+                this.showQuestionImage(q);
             }
 
             this.dom.options.innerHTML = '';
@@ -393,7 +399,7 @@
                 this.dom.options.appendChild(btn);
             }
             this.dom.prevBtn.disabled = q === 1;
-            if (q === 60) {
+            if (q === CONFIG.questionCount) {
                 this.dom.nextBtn.innerText = this.t('btn_finish');
                 this.dom.nextBtn.classList.add('btn-finish');
             } else {
@@ -402,9 +408,39 @@
             }
         }
 
+        /**
+         * Swap the matrix image through the browser cache. No blob URLs are
+         * created, so going back and forth costs no extra memory.
+         */
+        showQuestionImage(q) {
+            const img = this.dom.qImage;
+            if (!img) return;
+
+            const done = () => {
+                img.classList.remove('is-loading');
+                img.onload = null;
+                img.onerror = null;
+                // Only start background prefetching once the matrix the user is
+                // looking at has arrived, so it never competes for bandwidth.
+                this.preloader.schedule(q);
+            };
+
+            img.classList.add('is-loading');
+            img.onload = done;
+            img.onerror = done;
+            img.src = `${CONFIG.imagePath}${q}${CONFIG.imageExt}`;
+
+            // A cached image can be complete immediately.
+            if (img.complete && img.naturalWidth > 0) done();
+        }
+
         selectAnswer(val) {
             this.userAnswers[this.currentQuestion] = val;
-            this.renderQuestion();
+
+            const buttons = this.dom.options.children;
+            for (let i = 0; i < buttons.length; i++) {
+                buttons[i].classList.toggle('selected', i + 1 === val);
+            }
         }
 
         nextQuestion() {
