@@ -6,7 +6,7 @@
 
 A lightweight, browser-based implementation of Raven's Progressive Matrices (IQ Test).
 
-**Live demo:** <https://ikhlasulov.github.io/open-rpm-web/>
+**Live demo:** <https://ikhlasulov.github.io/openrpm-web/>
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=white)](https://www.javascript.com/)
